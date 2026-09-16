@@ -1,0 +1,22 @@
+{
+  "name": "opencode-session-cost",
+  "version": "0.1.0",
+  "description": "opencode plugin that tracks token usage and cost per response and per session, with a toast summary at the end of every chat turn",
+  "type": "module",
+  "main": "./src/index.ts",
+  "files": [
+    "src"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "cost",
+    "tokens"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest",
+    "@opencode-ai/sdk": "latest",
+    "typescript": "^5.6.0"
+  }
+}
