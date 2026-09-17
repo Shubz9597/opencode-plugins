@@ -174,6 +174,11 @@
   .msg.tools-only .bubble { background: transparent; border: 0; padding: 0; display: flex;
                             flex-direction: column; gap: 5px; }
   .dropzone { outline: 1px dashed var(--frost); outline-offset: -8px; border-radius: 16px; }
+  .turnsum { align-self: center; display: flex; gap: 12px; font-family: var(--mono); font-size: 11px;
+             color: var(--faint); border-top: 1px solid var(--frost-alt); padding: 7px 10px 0;
+             margin-top: 2px; width: 100%; justify-content: center; flex-wrap: wrap; }
+  .turnsum span b { color: var(--dim); font-weight: 500; }
+  .turnsum .c { color: var(--green); }
   .empty { margin: auto; text-align: center; color: var(--dim); padding: 40px 20px; }
   .empty .logo { font-size: 40px; margin-bottom: 12px; color: var(--faint); }
   .empty h1 { font-family: var(--serif); font-weight: 400; font-size: 30px; letter-spacing: -0.5px;
@@ -495,6 +500,40 @@
     });
   }
 
+  function fmtK(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    if (n >= 1000) return (n / 1000).toFixed(1) + "K";
+    return String(Math.round(n));
+  }
+
+  function turnSumDom(group) {
+    var cost = 0, tin = 0, tout = 0, tcache = 0, hasA = false, lastA = null;
+    group.forEach(function (m) {
+      if (m.role !== "assistant") return;
+      hasA = true;
+      cost += m.cost;
+      tin += m.tokens.input;
+      tout += m.tokens.output;
+      tcache += m.tokens.cacheRead;
+      lastA = m;
+    });
+    if (!hasA) return null;
+    var ctx = lastA ? lastA.tokens.input + lastA.tokens.cacheRead : 0;
+    var div = document.createElement("div");
+    div.className = "turnsum";
+    function part(html, cls) {
+      var s = document.createElement("span");
+      if (cls) s.className = cls;
+      s.innerHTML = html;
+      div.appendChild(s);
+    }
+    part("<b>" + "$" + cost.toFixed(4) + "</b>", "c");
+    part("↑ <b>" + fmtK(tin) + "</b>" + (tcache > 0 ? " <span>(+" + fmtK(tcache) + " cache)</span>" : ""));
+    part("↓ <b>" + fmtK(tout) + "</b>");
+    part("ctx <b>" + fmtK(ctx) + "</b>");
+    return div;
+  }
+
   function renderState(st) {
     var sig = JSON.stringify(st.messages.map(function (m) {
       return [m.id, JSON.stringify(m.segments).length, m.cost, m.attachments.length];
@@ -504,7 +543,19 @@
     stick = atBottom();
     msgs.textContent = "";
     if (!st.messages.length) { msgs.appendChild(emptyDom()); }
-    st.messages.forEach(function (m) { msgs.appendChild(msgDom(m)); });
+    // Group messages into turns (user prompt + its assistant/tool messages)
+    // and print a cost/token summary after each completed turn.
+    var turns = [];
+    st.messages.forEach(function (m) {
+      if (m.role === "user" || !turns.length) turns.push([]);
+      turns[turns.length - 1].push(m);
+    });
+    turns.forEach(function (group, idx) {
+      group.forEach(function (m) { msgs.appendChild(msgDom(m)); });
+      if (idx === turns.length - 1 && st.status !== "idle") return; // turn still running
+      var sum = turnSumDom(group);
+      if (sum) msgs.appendChild(sum);
+    });
     for (var i = st.messages.length - 1; i >= 0; i--) {
       if (st.messages[i].role === "assistant" && st.messages[i].model) {
         modelCur.textContent = st.messages[i].model.split("/").slice(1).join("/");

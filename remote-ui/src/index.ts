@@ -43,6 +43,7 @@ type SerializedMessage = {
   time: number
   cost: number
   model: string
+  tokens: { input: number; output: number; cacheRead: number }
 }
 
 type PendingPermission = { id: string; sessionID: string; type: string; title: string; time: number }
@@ -123,6 +124,11 @@ function serializeMessages(
         time: info.time?.created ?? 0,
         cost: info.role === "assistant" ? (info.cost ?? 0) : 0,
         model: info.role === "assistant" ? `${info.providerID}/${info.modelID}` : "",
+        tokens: {
+          input: info.tokens?.input ?? 0,
+          output: info.role === "assistant" ? (info.tokens?.output ?? 0) + (info.tokens?.reasoning ?? 0) : 0,
+          cacheRead: info.tokens?.cache?.read ?? 0,
+        },
       }
     })
     .filter((m) => m.segments.length > 0 || m.attachments.length > 0)
