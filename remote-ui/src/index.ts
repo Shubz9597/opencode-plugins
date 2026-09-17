@@ -192,13 +192,44 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
   ])
   void mkdir(ATTACH_DIR, { recursive: true }).then(cleanOldAttachments)
 
+  // Windows paths can arrive with backslashes or forward slashes and mixed
+  // case — canonicalize before deduping so projects never show twice.
+  const canonical = (d: string): string => d.replace(/\\/g, "/").replace(/\/+$/, "")
+  const sameDir = (a: string, b: string): boolean => canonical(a).toLowerCase() === canonical(b).toLowerCase()
   const projectDirs = (): string[] => {
-    const list = [directory, ...(options?.projects ?? [])]
-    return [...new Set(list.map((d) => d.replace(/[\\/]+$/, "")).filter(Boolean))]
+    const seen = new Set<string>()
+    const out: string[] = []
+    for (const d of [directory, ...(options?.projects ?? [])]) {
+      const key = canonical(d).toLowerCase()
+      if (!key || seen.has(key)) continue
+      seen.add(key)
+      out.push(d.replace(/[\\/]+$/, ""))
+    }
+    return out
   }
   const projectName = (dir: string): string => basename(dir) || dir
-  const dirFor = (url: URL): string => url.searchParams.get("directory")?.replace(/[\\/]+$/, "") || directory
+  // Resolve a requested directory to its native form. The host project must
+  // resolve to the plugin's exact `directory` — otherwise we'd scope events to
+  // a different instance and the TUI would stop mirroring remote prompts.
+  const dirFor = (url: URL): string => {
+    const input = url.searchParams.get("directory")?.replace(/[\\/]+$/, "") ?? ""
+    if (!input || sameDir(input, directory)) return directory
+    for (const p of options?.projects ?? []) if (sameDir(input, p)) return p.replace(/[\\/]+$/, "")
+    return input
+  }
+  // Own project: omit the param entirely (server default instance = the one
+  // the TUI listens to). Other projects: pass explicitly.
+  const qDir = (dir: string): { directory?: string } => (sameDir(dir, directory) ? {} : { directory: dir })
   const dirForSession = (sessionID: string): string => sessionDir.get(sessionID) ?? directory
+
+  // Surface remote activity in the TUI (toast) and serve console (log), since
+  // the TUI transcript doesn't mirror API-initiated prompts.
+  const notifyTUI = (message: string): void => {
+    void client.tui
+      .showToast({ body: { title: "remote UI", message, variant: "info", duration: 5000 } })
+      .catch(() => {})
+    void client.app.log({ body: { service: "remote-ui", level: "info", message } }).catch(() => {})
+  }
 
   let server: ReturnType<typeof createServer> | null = null
   let startPromise: Promise<string> | null = null
@@ -243,13 +274,35 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
       }
 
       if (req.method === "GET" && url.pathname === "/api/projects") {
-        return sendJSON(res, 200, projectDirs().map((dir) => ({ directory: dir, name: projectName(dir) })))
+        // Only expose projects that actually have sessions, most recently active first.
+        const out: Array<{ directory: string; name: string; sessions: number; updated: number }> = []
+        for (const dir of projectDirs()) {
+          try {
+            const r = await client.session.list({ query: qDir(dir) })
+            const sessions = (r.data ?? []).filter((s) => !s.parentID)
+            if (sessions.length > 0) {
+              out.push({
+                directory: dir,
+                name: projectName(dir),
+                sessions: sessions.length,
+                updated: Math.max(...sessions.map((s) => s.time?.updated ?? 0)),
+              })
+            }
+          } catch {
+            // Directory unreachable — skip it rather than showing a dead pill.
+          }
+        }
+        out.sort((a, b) => b.updated - a.updated)
+        if (out.length === 0) {
+          out.push({ directory, name: projectName(directory), sessions: 0, updated: 0 })
+        }
+        return sendJSON(res, 200, out)
       }
 
       if (req.method === "GET" && url.pathname === "/api/meta") {
         const [agentsRes, providersRes] = await Promise.all([
-          client.app.agents({ query: { directory: dir } }).catch(() => ({ data: [] })),
-          client.config.providers({ query: { directory: dir } }).catch(() => ({ data: undefined })),
+          client.app.agents({ query: qDir(dir) }).catch(() => ({ data: [] })),
+          client.config.providers({ query: qDir(dir) }).catch(() => ({ data: undefined })),
         ])
         const agents = (agentsRes.data ?? []).map((a) => ({
           name: a.name,
@@ -265,10 +318,31 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
           })),
         }))
         const defaultProvider = providerList[0]?.id
-        const defaultModel =
+        const configDefault =
           defaultProvider && providersRes.data?.default?.[defaultProvider]
             ? `${defaultProvider}/${providersRes.data.default[defaultProvider]}`
             : models[0]?.models[0]?.value
+        // Prefer the model the most recent session actually used — config
+        // defaults can point at a different model than what the user runs.
+        let recentModel: string | undefined
+        const recent = await client.session
+          .list({ query: qDir(dir) })
+          .catch(() => ({ data: [] as Array<any> }))
+        for (const s of (recent.data ?? []).filter((s) => !s.parentID).slice(0, 3)) {
+          const msgs = await client.session
+            .messages({ path: { id: s.id }, query: qDir(dir) })
+            .catch(() => ({ data: [] as Array<any> }))
+          const rows = msgs.data ?? []
+          for (let i = rows.length - 1; i >= 0; i--) {
+            const info = rows[i].info
+            if (info.role === "assistant" && info.modelID) {
+              recentModel = `${info.providerID}/${info.modelID}`
+              break
+            }
+          }
+          if (recentModel) break
+        }
+        const defaultModel = recentModel ?? configDefault
         return sendJSON(res, 200, {
           agents,
           models,
@@ -278,7 +352,7 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
       }
 
       if (req.method === "GET" && url.pathname === "/api/sessions") {
-        const result = await client.session.list({ query: { directory: dir } })
+        const result = await client.session.list({ query: qDir(dir) })
         for (const s of result.data ?? []) sessionDir.set(s.id, dir)
         const sessions = (result.data ?? [])
           .filter((s) => !s.parentID)
@@ -293,8 +367,8 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
         if (!sessionID) return sendJSON(res, 400, { error: "sessionID required" })
         sessionDir.set(sessionID, dir)
         const [messagesRes, statusRes] = await Promise.all([
-          client.session.messages({ path: { id: sessionID }, query: { directory: dir } }),
-          client.session.status({ query: { directory: dir } }).catch(() => ({ data: undefined })),
+          client.session.messages({ path: { id: sessionID }, query: qDir(dir) }),
+          client.session.status({ query: qDir(dir) }).catch(() => ({ data: undefined })),
         ])
         const permissions = [...pendingPermissions.values()]
           .filter((p) => p.sessionID === sessionID)
@@ -311,7 +385,7 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
         const messageID = url.searchParams.get("messageID") ?? ""
         const partID = url.searchParams.get("partID") ?? ""
         if (!sessionID || !messageID || !partID) return sendJSON(res, 400, { error: "missing params" })
-        const result = await client.session.messages({ path: { id: sessionID }, query: { directory: dir } })
+        const result = await client.session.messages({ path: { id: sessionID }, query: qDir(dir) })
         for (const row of result.data ?? []) {
           if (row.info.id !== messageID) continue
           for (const part of row.parts) {
@@ -346,7 +420,7 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
         let sessionID = body.sessionID
         if (sessionID) {
           const status = await client.session
-            .status({ query: { directory: dir } })
+            .status({ query: qDir(dir) })
             .catch(() => ({ data: undefined }))
           if (status.data?.[sessionID]?.type === "busy") {
             return sendJSON(res, 409, { error: "session is busy â€” wait or press Stop" })
@@ -355,7 +429,7 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
         if (!sessionID || sessionID === "null") {
           const created = await client.session.create({
             body: { title: (text || safeName(attachments[0]?.name ?? "session")).slice(0, 80) },
-            query: { directory: dir },
+            query: qDir(dir),
           })
           sessionID = created.data!.id
         }
@@ -369,21 +443,23 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
           void client.session
             .command({
               path: { id: sessionID },
-              query: { directory: dir },
+              query: qDir(dir),
               body: { command, arguments: args, agent: body.agent || defaultAgent },
             })
             .catch(() => {})
-          return sendJSON(res, 202, { sessionID, mode: "command" })
+          notifyTUI(`command → ${sessionID.slice(-6)}: ${command}`)
+        return sendJSON(res, 202, { sessionID, mode: "command" })
         }
         if (text.startsWith("!") && attachments.length === 0) {
           void client.session
             .shell({
               path: { id: sessionID },
-              query: { directory: dir },
+              query: qDir(dir),
               body: { command: text.slice(1).trim(), agent: body.agent || defaultAgent },
             })
             .catch(() => {})
-          return sendJSON(res, 202, { sessionID, mode: "shell" })
+          notifyTUI(`shell → ${sessionID.slice(-6)}: ${text.slice(1, 61)}`)
+        return sendJSON(res, 202, { sessionID, mode: "shell" })
         }
 
         const model = body.model?.includes("/")
@@ -410,10 +486,13 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
         void client.session
           .promptAsync({
             path: { id: sessionID },
-            query: { directory: dir },
+            query: qDir(dir),
             body: { parts: parts as any, agent: body.agent || defaultAgent, model },
           })
           .catch(() => {})
+          notifyTUI(
+            `prompt → ${sessionID.slice(-6)}: ${(text || attachments.map((a) => a.name).join(", ")).slice(0, 80)}`,
+          )
         return sendJSON(res, 202, { sessionID, mode: "prompt" })
       }
 
@@ -421,10 +500,11 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
         const body = JSON.parse((await readBody(req)) || "{}") as { sessionID?: string }
         if (!body.sessionID) return sendJSON(res, 400, { error: "sessionID required" })
         try {
-          await client.session.abort({ path: { id: body.sessionID }, query: { directory: dir } })
+          await client.session.abort({ path: { id: body.sessionID }, query: qDir(dir) })
         } catch {
-          // Session may already be idle â€” nothing to abort.
+          // Session may already be idle — nothing to abort.
         }
+        notifyTUI(`abort → ${body.sessionID.slice(-6)}`)
         return sendJSON(res, 200, { ok: true })
       }
 
@@ -441,12 +521,13 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
         try {
           await client.postSessionIdPermissionsPermissionId({
             path: { id: body.sessionID, permissionID: body.permissionID },
-            query: { directory: dir },
+            query: qDir(dir),
             body: { response },
           })
         } catch {
           // Permission may have been answered from the TUI in the meantime.
         }
+        notifyTUI(`permission ${response} → ${body.sessionID.slice(-6)}`)
         return sendJSON(res, 200, { ok: true })
       }
 

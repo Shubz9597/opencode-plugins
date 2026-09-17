@@ -227,9 +227,17 @@
             border-radius: 6px; background: var(--tint); color: var(--green); }
   #status.on { display: inline-flex; align-items: center; gap: 7px; }
   #status.retry { color: var(--yellow); }
+  .dots { display: inline-flex; gap: 3px; align-items: center; }
+  .dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--green);
+            animation: bounce 1s infinite; }
+  .dots i:nth-child(2) { animation-delay: .15s; }
+  .dots i:nth-child(3) { animation-delay: .3s; }
+  @keyframes bounce { 0%, 60%, 100% { transform: none; opacity: .35; } 30% { transform: translateY(-4px); opacity: 1; } }
+  .chip.queued { color: var(--yellow); border-color: rgba(255, 197, 61, 0.34); }
 
   /* Composer vertical centering + project chips */
   .composer { align-items: center; }
+  .composer button#attach { font-size: 18px; padding: 8px 16px; line-height: 1; }
   .prow { display: flex; gap: 6px; padding: 10px 12px; overflow-x: auto; }
   .pchip { flex: 0 0 auto; border: 1px solid var(--frost); background: transparent; color: var(--dim);
            border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer; font-family: var(--sans); }
@@ -266,6 +274,7 @@
 <footer>
   <div class="foot-inner">
     <div id="status"></div>
+    <div id="qchips"></div>
     <div id="chips"></div>
     <div class="composer">
       <button id="attach" class="ghost" title="Attach files">＋</button>
@@ -504,9 +513,19 @@
     }
     scroll();
     renderBanner(st.permissions);
+    var lastTool = "";
+    for (var i = st.messages.length - 1; i >= 0 && !lastTool; i--) {
+      var segs = st.messages[i].segments;
+      for (var j = segs.length - 1; j >= 0; j--) {
+        if (segs[j].type === "tool") { lastTool = segs[j].name; break; }
+      }
+    }
     statusEl.className = st.status === "retry" ? "on retry" : st.status === "busy" ? "on" : "";
-    statusEl.innerHTML = st.status === "busy" ? '<span class="dot"></span>Working…'
-      : st.status === "retry" ? '<span class="dot"></span>Retrying…' : "";
+    statusEl.innerHTML = st.status === "busy"
+      ? '<span class="dots"><i></i><i></i><i></i></span> Working' + (lastTool ? " · " + lastTool : "") + "…"
+      : st.status === "retry"
+        ? '<span class="dots"><i></i><i></i><i></i></span> Retrying…'
+        : "";
   }
 
   function poll() {
@@ -531,6 +550,7 @@
     es.onmessage = function (e) {
       try {
         var evt = JSON.parse(e.data);
+        if (evt.type === "session.idle" && evt.sessionID === current) setTimeout(flushQueue, 600);
         if (evt.sessionID && evt.sessionID !== current && evt.type.indexOf("permission") !== 0) return;
         schedulePoll(evt.type === "session.idle" || evt.type === "permission.updated");
       } catch (err) {}
@@ -560,10 +580,12 @@
   function refreshSessions(keepId) {
     jsonReq("/api/sessions?directory=" + encodeURIComponent(activeProject || "")).then(function (r) { return r.json(); }).then(function (list) {
       sessionList = list || [];
-      var sel = keepId || current;
-      if (!sel && sessionList.length) sel = sessionList[0].id;
       var found = null;
-      sessionList.forEach(function (s) { if (s.id === sel) found = s; });
+      var wanted = keepId !== undefined ? keepId : current;
+      sessionList.forEach(function (s) { if (s.id === wanted) found = s; });
+      // No explicit target (project switch / startup): auto-open the most
+      // recent session — that's the one likely running.
+      if (!found && keepId === undefined && sessionList.length) found = sessionList[0];
       setSession(found ? found.id : null, found ? found.title : null);
     });
   }
@@ -584,13 +606,12 @@
       var chip = document.createElement("button");
       chip.className = "pchip" + (p.directory === activeProject ? " active" : "");
       chip.textContent = p.name;
+      chip.title = p.sessions + " session" + (p.sessions === 1 ? "" : "s");
       chip.addEventListener("click", function () {
         if (activeProject === p.directory) return;
         activeProject = p.directory;
-        current = null; currentTitle = null;
-        sessionCur.textContent = "New session";
         loadMeta();
-        renderSessionPanel();
+        refreshSessions();
       });
       prow.appendChild(chip);
     });
@@ -690,31 +711,68 @@
     });
   }
 
-  function send() {
-    var text = input.value.trim();
-    if (!text && !attachments.length) return;
+  var queue = [];
+
+  function doSend(payload) {
     sendBtn.disabled = true;
-    var body = {
-      sessionID: current,
-      directory: activeProject,
-      text: text,
-      agent: agent,
-      attachments: attachments.map(function (a) { return { name: a.name, mime: a.mime, data: a.b64 }; })
-    };
-    jsonReq("/api/send?directory=" + encodeURIComponent(activeProject || ""), { method: "POST", body: JSON.stringify(body) })
+    jsonReq("/api/send?directory=" + encodeURIComponent(activeProject || ""), { method: "POST", body: JSON.stringify(payload) })
       .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, b: b }; }); })
       .then(function (res) {
-        if (!res.ok) { alert(res.b.error || "send failed"); }
+        if (!res.ok) {
+          if (res.b && res.b.error && res.b.error.indexOf("busy") >= 0) {
+            queue.push(payload);
+            renderQueue();
+          } else {
+            alert(res.b.error || "send failed");
+          }
+        }
         else {
-          input.value = "";
-          input.style.height = "auto";
-          attachments = []; addChips();
           if (current !== res.b.sessionID) refreshSessions(res.b.sessionID);
           else setTimeout(poll, 250);
         }
       })
       .catch(function () { alert("network error"); })
       .finally(function () { sendBtn.disabled = false; });
+  }
+
+  function renderQueue() {
+    var q = document.getElementById("qchips");
+    q.textContent = "";
+    queue.forEach(function (p, i) {
+      var chip = document.createElement("span");
+      chip.className = "chip queued";
+      var label = document.createElement("span");
+      label.textContent = "⏳ " + (p.text || "attachment").slice(0, 70);
+      chip.appendChild(label);
+      var x = document.createElement("button");
+      x.textContent = "×";
+      x.addEventListener("click", function () { queue.splice(i, 1); renderQueue(); });
+      chip.appendChild(x);
+      q.appendChild(chip);
+    });
+  }
+
+  function flushQueue() {
+    if (!queue.length || !current) return;
+    var next = queue.shift();
+    renderQueue();
+    doSend(next);
+  }
+
+  function send() {
+    var text = input.value.trim();
+    if (!text && !attachments.length) return;
+    var payload = {
+      sessionID: current,
+      directory: activeProject,
+      text: text,
+      agent: agent,
+      attachments: attachments.map(function (a) { return { name: a.name, mime: a.mime, data: a.b64 }; })
+    };
+    input.value = "";
+    input.style.height = "auto";
+    attachments = []; addChips();
+    doSend(payload);
   }
 
   function addFile(f) {
