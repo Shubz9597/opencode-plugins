@@ -240,7 +240,12 @@
   @keyframes bounce { 0%, 60%, 100% { transform: none; opacity: .35; } 30% { transform: translateY(-4px); opacity: 1; } }
   .chip.queued { color: var(--yellow); border-color: rgba(255, 197, 61, 0.34); }
   .msg.user .bubble { position: relative; }
-  .bubble.queued { opacity: .6; border-style: dashed; }
+  .msg.user .bubble.queued {
+    background: rgba(255, 197, 61, 0.10);
+    border: 1px dashed rgba(255, 197, 61, 0.5);
+    color: var(--yellow);
+    opacity: 1;
+  }
   .qlabel { font-size: 10.5px; text-transform: uppercase; letter-spacing: .5px;
             color: var(--yellow); margin-bottom: 5px; }
   .bubble .qdel { position: absolute; top: 6px; right: 8px; background: none; border: 0;
