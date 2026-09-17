@@ -36,7 +36,7 @@ type SerializedMessage = {
   id: string
   role: string
   segments: Array<
-    | { type: "text" | "thinking"; text: string; streaming?: boolean }
+    | { type: "text" | "thinking"; text: string; streaming?: boolean; durationMs?: number }
     | { type: "tool"; name: string; text: string }
   >
   attachments: Array<{ name: string; mime: string; url: string }>
@@ -99,7 +99,13 @@ function serializeMessages(
         if (part.type === "text" && !part.synthetic && !part.ignored && part.text) {
           segments.push({ type: "text", text: part.text })
         } else if (part.type === "reasoning" && part.text) {
-          segments.push({ type: "thinking", text: part.text, streaming: !part.time?.end })
+          segments.push({
+            type: "thinking",
+            text: part.text,
+            streaming: !part.time?.end,
+            durationMs:
+              part.time?.start && part.time?.end ? Math.max(0, part.time.end - part.time.start) : undefined,
+          })
         } else if (part.type === "file") {
           const isRemote = /^https?:/i.test(part.url ?? "")
           attachments.push({

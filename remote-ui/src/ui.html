@@ -329,9 +329,17 @@
   var attachments = [];
   var stick = true;
 
-  function atBottom() { return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80; }
+  function atBottom() { return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 160; }
   scroller.addEventListener("scroll", function () { stick = atBottom(); });
-  function scroll() { if (stick) scroller.scrollTop = scroller.scrollHeight; }
+  function scroll() {
+    if (!stick) return;
+    // Apply after layout settles — mobile browsers report stale heights mid-render
+    // (fonts/images/keyboard), so pin twice across frames.
+    requestAnimationFrame(function () {
+      scroller.scrollTop = scroller.scrollHeight;
+      requestAnimationFrame(function () { scroller.scrollTop = scroller.scrollHeight; });
+    });
+  }
 
   function relTime(t) {
     if (!t) return "";
@@ -341,6 +349,11 @@
     var h = Math.floor(m / 60);
     if (h < 24) return h + "h";
     return Math.floor(h / 24) + "d";
+  }
+
+  function fmtDur(ms) {
+    if (ms >= 60000) return Math.floor(ms / 60000) + "m " + Math.round((ms % 60000) / 1000) + "s";
+    return (ms / 1000).toFixed(1) + "s";
   }
 
   function renderMd(el, text) {
@@ -408,7 +421,11 @@
           sum.appendChild(dot);
         }
         var lbl = document.createElement("span");
-        lbl.textContent = seg.streaming ? "Thinking…" : "Thought process";
+        lbl.textContent = seg.streaming
+          ? "Thinking…"
+          : seg.durationMs
+            ? "Thought for " + fmtDur(seg.durationMs)
+            : "Thought process";
         sum.appendChild(lbl);
         var chev = document.createElement("span");
         chev.className = "chev";
