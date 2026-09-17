@@ -239,6 +239,13 @@
   .dots i:nth-child(3) { animation-delay: .3s; }
   @keyframes bounce { 0%, 60%, 100% { transform: none; opacity: .35; } 30% { transform: translateY(-4px); opacity: 1; } }
   .chip.queued { color: var(--yellow); border-color: rgba(255, 197, 61, 0.34); }
+  .msg.user .bubble { position: relative; }
+  .bubble.queued { opacity: .6; border-style: dashed; }
+  .qlabel { font-size: 10.5px; text-transform: uppercase; letter-spacing: .5px;
+            color: var(--yellow); margin-bottom: 5px; }
+  .bubble .qdel { position: absolute; top: 6px; right: 8px; background: none; border: 0;
+                  color: var(--red); font-size: 15px; cursor: pointer; padding: 0;
+                  font-family: var(--sans); }
 
   /* Composer vertical centering + project chips */
   .composer { align-items: center; }
@@ -279,7 +286,6 @@
 <footer>
   <div class="foot-inner">
     <div id="status"></div>
-    <div id="qchips"></div>
     <div id="chips"></div>
     <div class="composer">
       <button id="attach" class="ghost" title="Attach files">＋</button>
@@ -577,6 +583,7 @@
       : st.status === "retry"
         ? '<span class="dots"><i></i><i></i><i></i></span> Retrying…'
         : "";
+    appendQueue();
   }
 
   function poll() {
@@ -763,6 +770,31 @@
   }
 
   var queue = [];
+  var queueDom = null;
+
+  function appendQueue() {
+    if (queueDom) { queueDom.remove(); queueDom = null; }
+    if (!queue.length || !current) return;
+    queueDom = document.createElement("div");
+    queueDom.className = "msg user";
+    queue.forEach(function (p, i) {
+      var wrap = document.createElement("div");
+      wrap.className = "bubble queued";
+      var label = document.createElement("div");
+      label.className = "qlabel";
+      label.textContent = "⏳ queued — sends when the agent finishes";
+      var txt = document.createElement("span");
+      txt.textContent = p.text || "📎 " + ((p.attachments && p.attachments[0] && p.attachments[0].name) || "attachment");
+      var x = document.createElement("button");
+      x.className = "qdel";
+      x.textContent = "×";
+      x.addEventListener("click", function () { queue.splice(i, 1); appendQueue(); });
+      wrap.appendChild(label); wrap.appendChild(txt); wrap.appendChild(x);
+      queueDom.appendChild(wrap);
+    });
+    msgs.appendChild(queueDom);
+    scroll();
+  }
 
   function doSend(payload) {
     sendBtn.disabled = true;
@@ -772,7 +804,7 @@
         if (!res.ok) {
           if (res.b && res.b.error && res.b.error.indexOf("busy") >= 0) {
             queue.push(payload);
-            renderQueue();
+            appendQueue();
           } else {
             alert(res.b.error || "send failed");
           }
@@ -786,27 +818,10 @@
       .finally(function () { sendBtn.disabled = false; });
   }
 
-  function renderQueue() {
-    var q = document.getElementById("qchips");
-    q.textContent = "";
-    queue.forEach(function (p, i) {
-      var chip = document.createElement("span");
-      chip.className = "chip queued";
-      var label = document.createElement("span");
-      label.textContent = "⏳ " + (p.text || "attachment").slice(0, 70);
-      chip.appendChild(label);
-      var x = document.createElement("button");
-      x.textContent = "×";
-      x.addEventListener("click", function () { queue.splice(i, 1); renderQueue(); });
-      chip.appendChild(x);
-      q.appendChild(chip);
-    });
-  }
-
   function flushQueue() {
     if (!queue.length || !current) return;
     var next = queue.shift();
-    renderQueue();
+    appendQueue();
     doSend(next);
   }
 

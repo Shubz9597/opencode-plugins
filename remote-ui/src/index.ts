@@ -280,9 +280,33 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
       }
 
       if (req.method === "GET" && url.pathname === "/api/projects") {
-        // Only expose projects that actually have sessions, most recently active first.
+        // Configured projects + own directory + auto-discovered siblings of the
+        // own directory (e.g. everything under D:\\Projects). Only projects that
+        // actually have sessions are exposed, most recently active first.
+        const candidates = new Map<string, string>()
+        const add = (d: string): void => {
+          if (!d) return
+          const key = canonical(d).toLowerCase()
+          if (!key || candidates.has(key)) return
+          candidates.set(key, d.replace(/[\\/]+$/, ""))
+        }
+        add(directory)
+        for (const p of options?.projects ?? []) add(p)
+        try {
+          const parent = dirname(directory)
+          const entries = await readdir(parent, { withFileTypes: true })
+          let scanned = 0
+          for (const e of entries) {
+            if (!e.isDirectory() || e.name.startsWith(".") || e.name === "node_modules") continue
+            if (scanned >= 40) break
+            scanned++
+            add(join(parent, e.name))
+          }
+        } catch {
+          // Parent not readable - configured projects still work.
+        }
         const out: Array<{ directory: string; name: string; sessions: number; updated: number }> = []
-        for (const dir of projectDirs()) {
+        for (const dir of candidates.values()) {
           try {
             const r = await client.session.list({ query: qDir(dir) })
             const sessions = (r.data ?? []).filter((s) => !s.parentID)
@@ -295,7 +319,7 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
               })
             }
           } catch {
-            // Directory unreachable — skip it rather than showing a dead pill.
+            // Directory unreachable - skip it rather than showing a dead pill.
           }
         }
         out.sort((a, b) => b.updated - a.updated)
