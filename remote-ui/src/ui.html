@@ -487,8 +487,21 @@
     return div;
   }
 
-  function renderBanner(perms) {
-    if (!perms.length) { banner.style.display = "none"; banner.textContent = ""; return; }
+  function renderBanner(perms, pendingOther) {
+    if (!perms.length) {
+      if (pendingOther > 0) {
+        banner.style.display = "flex";
+        banner.textContent = "";
+        var info = document.createElement("span");
+        info.textContent = "⏳ " + pendingOther + " permission" + (pendingOther > 1 ? "s" : "") +
+          " pending in other session" + (pendingOther > 1 ? "s" : "") + " — open that session in the Session dropdown to respond";
+        banner.appendChild(info);
+      } else {
+        banner.style.display = "none";
+        banner.textContent = "";
+      }
+      return;
+    }
     var p = perms[0];
     banner.style.display = "flex";
     banner.textContent = "";
@@ -543,7 +556,7 @@
   function renderState(st) {
     var sig = JSON.stringify(st.messages.map(function (m) {
       return [m.id, JSON.stringify(m.segments).length, m.cost, m.attachments.length];
-    })) + "|" + st.status + "|" + JSON.stringify(st.permissions.map(function (p) { return p.id; }));
+    })) + "|" + st.status + "|" + JSON.stringify(st.permissions.map(function (p) { return p.id; })) + "|" + (st.pendingOther || 0);
     if (lastSig[current] === sig) return;
     lastSig[current] = sig;
     stick = atBottom();
@@ -569,7 +582,8 @@
       }
     }
     scroll();
-    renderBanner(st.permissions);
+    appendQueue();
+    renderBanner(st.permissions, st.pendingOther || 0);
     var lastTool = "";
     for (var i = st.messages.length - 1; i >= 0 && !lastTool; i--) {
       var segs = st.messages[i].segments;
@@ -587,7 +601,7 @@
   }
 
   function poll() {
-    if (!current) { msgs.textContent = ""; msgs.appendChild(emptyDom()); renderBanner([]); statusEl.className = ""; statusEl.innerHTML = ""; return; }
+    if (!current) { msgs.textContent = ""; msgs.appendChild(emptyDom()); renderBanner([], 0); statusEl.className = ""; statusEl.innerHTML = ""; return; }
     jsonReq("/api/state?sessionID=" + encodeURIComponent(current) + "&directory=" + encodeURIComponent(activeProject || ""))
       .then(function (r) { return r.json(); })
       .then(renderState)

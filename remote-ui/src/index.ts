@@ -406,6 +406,7 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
         return sendJSON(res, 200, {
           status: statusRes.data?.[sessionID]?.type ?? "idle",
           permissions,
+          pendingOther: Math.max(0, pendingPermissions.size - permissions.length),
           messages: serializeMessages((messagesRes.data ?? []) as Array<{ info: any; parts: Array<any> }>),
         })
       }
@@ -658,6 +659,7 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
             title: p.title,
             time: p.time?.created ?? Date.now(),
           })
+          notifyTUI(`permission [${p.type}] → ${p.sessionID.slice(-6)}: ${p.title}`)
           break
         }
         case "permission.replied": {
