@@ -87,6 +87,8 @@ export type SessionCostOptions = {
   showTime?: boolean
   /** Show a second line with cumulative session totals (default true) */
   showSessionTotals?: boolean
+  /** Show the per-turn toast at the end of each response (default true) */
+  toast?: boolean
   /** Where to fetch per-model pricing from (default models.dev) */
   pricingUrl?: string
   /** How often to re-fetch pricing, in ms (default 6 hours) */
@@ -126,10 +128,11 @@ function parsePriceTable(json: unknown): PriceTable {
   return table
 }
 
-export const SessionCostPlugin: Plugin = async ({ client }, options?: SessionCostOptions) => {
+export const SessionCostPlugin: Plugin = async ({ client, directory }, options?: SessionCostOptions) => {
   const toastDuration = options?.toastDuration ?? 8000
   const showTime = options?.showTime ?? true
   const showSessionTotals = options?.showSessionTotals ?? true
+  const toastEnabled = options?.toast ?? true
   const pricingUrl = options?.pricingUrl ?? "https://models.dev/api.json"
   const pricingRefreshMs = options?.pricingRefreshMs ?? 6 * 60 * 60 * 1000
   const useReportedCost = options?.useReportedCost ?? false
@@ -295,7 +298,7 @@ export const SessionCostPlugin: Plugin = async ({ client }, options?: SessionCos
           }
 
           const title = `Response ${fmtCost(turnUsage.cost)} · ${turnUsage.messages} message${turnUsage.messages > 1 ? "s" : ""}`
-          await showToast(title, lines.join("\n"))
+          if (toastEnabled) await showToast(title, lines.join("\n"))
           break
         }
 
@@ -312,40 +315,120 @@ export const SessionCostPlugin: Plugin = async ({ client }, options?: SessionCos
     tool: {
       cost: tool({
         description:
-          "Get a token and cost report for the current opencode session: input/output/cache tokens, " +
-          "per-turn and cumulative cost, computed with corrected provider rates. " +
-          "Use whenever the user asks about cost, spend, tokens, or usage.",
+          "Get a compact token and cost report for ALL opencode sessions in this project, one line per " +
+          "session: input/output/cache tokens and total cost, summed from stored messages at the provider's " +
+          "rates (matches what the provider actually deducts). " +
+          "Use whenever the user asks about cost, spend, tokens, or usage. " +
+          "Reply with ONLY the text this tool returns, nothing else.",
         args: {},
-        async execute(_args, context) {
-          const sessionID = (context as { sessionID?: string } | undefined)?.sessionID
-          const lines: string[] = []
+        async execute() {
+          const sessionsRes = await client.session
+            .list({ query: { directory } })
+            .catch(() => ({ data: [] as Array<any> }))
+          const rows: Array<{
+            title: string
+            id: string
+            input: number
+            output: number
+            cacheRead: number
+            cost: number
+          }> = []
 
-          const report = (label: string, u: Usage): void => {
-            lines.push(`${label}:`)
-            lines.push(`  Responses: ${u.messages}`)
-            lines.push(
-              `  Tokens: ↑ ${fmtInt(u.input)} in (+${fmtInt(u.cacheRead)} cache read, +${fmtInt(u.cacheWrite)} cache write)  ↓ ${fmtInt(u.output)} out (${fmtInt(u.reasoning)} reasoning)`,
-            )
-            lines.push(`  Cost: ${fmtCost(u.cost)}`)
-            if (Math.abs(u.cost - u.reportedCost) > Math.max(0.02 * u.reportedCost, 0.0001)) {
-              lines.push(`  (opencode internally reports ${fmtCost(u.reportedCost)})`)
+          for (const s of sessionsRes.data ?? []) {
+            if (s.parentID) continue
+            const msgs = await client.session
+              .messages({ path: { id: s.id }, query: { directory } })
+              .catch(() => ({ data: [] as Array<any> }))
+            let input = 0
+            let output = 0
+            let cacheRead = 0
+            let cost = 0
+            let count = 0
+            for (const { info } of msgs.data ?? []) {
+              if (info.role !== "assistant") continue
+              input += info.tokens?.input ?? 0
+              output += (info.tokens?.output ?? 0) + (info.tokens?.reasoning ?? 0)
+              cacheRead += info.tokens?.cache?.read ?? 0
+              cost += info.cost ?? 0
+              count++
             }
+            if (count === 0) continue
+            rows.push({ title: s.title || s.id, id: s.id, input, output, cacheRead, cost })
           }
 
-          const tracked = [...session.entries()]
-          if (sessionID && session.has(sessionID)) {
-            report("This session", session.get(sessionID)!)
-          } else if (sessionID) {
-            lines.push(`No usage tracked yet for session ${sessionID}.`)
+          if (rows.length === 0) return "No token usage recorded in any session yet."
+
+          rows.sort((a, b) => b.cost - a.cost)
+          const maxRows = 15
+          const shown = rows.slice(0, maxRows)
+          const titleWidth = Math.min(38, Math.max(...shown.map((r) => r.title.length)))
+
+          const lines: string[] = []
+          lines.push(
+            "SESSION".padEnd(titleWidth) +
+              "  " +
+              "INPUT(+CACHE)".padStart(18) +
+              "  " +
+              "OUTPUT".padStart(10) +
+              "  " +
+              "COST",
+          )
+          for (const r of shown) {
+            const title = r.title.length > titleWidth ? r.title.slice(0, titleWidth - 1) + "…" : r.title
+            lines.push(
+              title.padEnd(titleWidth) +
+                "  " +
+                `${fmtTokens(r.input)}(+${fmtTokens(r.cacheRead)})`.padStart(18) +
+                "  " +
+                fmtTokens(r.output).padStart(10) +
+                "  " +
+                fmtCost(r.cost),
+            )
           }
 
-          const grand = emptyUsage()
-          for (const [, u] of tracked) addUsage(grand, u)
-          if (tracked.length > 1) {
-            lines.push("")
-            report(`All sessions since start (${tracked.length})`, grand)
+          const total = rows.reduce(
+            (acc, r) => {
+              acc.input += r.input
+              acc.output += r.output
+              acc.cacheRead += r.cacheRead
+              acc.cost += r.cost
+              return acc
+            },
+            { input: 0, output: 0, cacheRead: 0, cost: 0 },
+          )
+
+          lines.push("-".repeat(titleWidth + 55))
+          if (rows.length > maxRows) {
+            const rest = rows.slice(maxRows).reduce((acc, r) => acc + r.cost, 0)
+            lines.push(`(+${rows.length - maxRows} more sessions: ${fmtCost(rest)})`)
           }
-          if (lines.length === 0) return "No token usage tracked yet this run."
+          lines.push(
+            `TOTAL (${rows.length} sessions)`.padEnd(titleWidth) +
+              "  " +
+              `${fmtTokens(total.input)}(+${fmtTokens(total.cacheRead)})`.padStart(18) +
+              "  " +
+              fmtTokens(total.output).padStart(10) +
+              "  " +
+              fmtCost(total.cost),
+          )
+
+          // Tab-separated copy for Excel / Sheets — raw numbers, one row per session.
+          lines.push("")
+          lines.push("TSV (select this block and copy straight into Excel):")
+          lines.push(["session", "input_tokens", "cache_read_tokens", "output_tokens", "cost_usd"].join("\t"))
+          for (const r of rows) {
+            lines.push(
+              [r.title.replace(/\t/g, " "), r.input, r.cacheRead, r.output, r.cost.toFixed(4)].join("\t"),
+            )
+          }
+          lines.push(
+            ["TOTAL", total.input, total.cacheRead, total.output, total.cost.toFixed(4)].join("\t"),
+          )
+          lines.push("")
+          lines.push(
+            "Cost = tokens x provider rates (z.ai: $0.15 in / $0.50 out / $0.03 cached per 1M), " +
+              "so it should match what z.ai deducts (minus non-token charges like web search).",
+          )
           return lines.join("\n")
         },
       }),

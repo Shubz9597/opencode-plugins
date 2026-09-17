@@ -1,4 +1,4 @@
-﻿import { tool, type Plugin } from "@opencode-ai/plugin"
+import { tool, type Plugin } from "@opencode-ai/plugin"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import { execFile } from "node:child_process"
 import { createReadStream, existsSync, readFileSync, statSync } from "node:fs"
@@ -26,14 +26,19 @@ export type RemoteUIOptions = {
   token?: string
   /** Agent used when sending prompts (default "build") */
   agent?: string
-  /** Start the web server as soon as opencode loads (default false â€” start via the `remote` tool or /remote command) */
+  /** Start the web server as soon as opencode loads (default false — start via the `remote` tool or /remote command) */
   autoStart?: boolean
+  /** Other project directories to expose in the UI (absolute paths); the plugin's own directory is always included */
+  projects?: string[]
 }
 
 type SerializedMessage = {
   id: string
   role: string
-  segments: Array<{ type: "text" | "tool" | "thinking"; text: string; streaming?: boolean }>
+  segments: Array<
+    | { type: "text" | "thinking"; text: string; streaming?: boolean }
+    | { type: "tool"; name: string; text: string }
+  >
   attachments: Array<{ name: string; mime: string; url: string }>
   time: number
   cost: number
@@ -107,10 +112,7 @@ function serializeMessages(
           const state = part.state ?? {}
           const title =
             state.title || state.input?.description || state.input?.command || state.input?.filePath || ""
-          segments.push({
-            type: "tool",
-            text: `${part.tool}${title ? ` â€” ${String(title).slice(0, 220)}` : ""}`,
-          })
+          segments.push({ type: "tool", name: String(part.tool), text: String(title).slice(0, 400) })
         }
       }
       return {
@@ -161,7 +163,42 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
   const autoStart = options?.autoStart ?? false
 
   const pendingPermissions = new Map<string, PendingPermission>()
+  // sessionID -> project directory, so abort/permission replies reach the right project.
+  const sessionDir = new Map<string, string>()
+  // SSE subscribers (the web UI) — pushed live opencode events.
+  const sseClients = new Set<ServerResponse>()
+  let heartbeat: ReturnType<typeof setInterval> | null = null
+
+  const broadcast = (payload: string): void => {
+    for (const client of sseClients) {
+      try {
+        client.write(`data: ${payload}\n\n`)
+      } catch {
+        sseClients.delete(client)
+      }
+    }
+  }
+  const forwardedEvents = new Set([
+    "message.updated",
+    "message.part.updated",
+    "message.part.removed",
+    "session.created",
+    "session.updated",
+    "session.deleted",
+    "session.status",
+    "session.idle",
+    "permission.updated",
+    "permission.replied",
+  ])
   void mkdir(ATTACH_DIR, { recursive: true }).then(cleanOldAttachments)
+
+  const projectDirs = (): string[] => {
+    const list = [directory, ...(options?.projects ?? [])]
+    return [...new Set(list.map((d) => d.replace(/[\\/]+$/, "")).filter(Boolean))]
+  }
+  const projectName = (dir: string): string => basename(dir) || dir
+  const dirFor = (url: URL): string => url.searchParams.get("directory")?.replace(/[\\/]+$/, "") || directory
+  const dirForSession = (sessionID: string): string => sessionDir.get(sessionID) ?? directory
 
   let server: ReturnType<typeof createServer> | null = null
   let startPromise: Promise<string> | null = null
@@ -175,6 +212,7 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
   const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`)
     try {
+      const dir = dirFor(url)
       if (!authorized(url, req)) {
         return sendJSON(res, 401, { error: "unauthorized" })
       }
@@ -191,10 +229,27 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
         return res.end(html.replace("__TOKEN__", JSON.stringify(token)))
       }
 
+      if (req.method === "GET" && url.pathname === "/api/events") {
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-store",
+          connection: "keep-alive",
+          "x-accel-buffering": "no",
+        })
+        res.write("retry: 3000\n\n")
+        sseClients.add(res)
+        req.on("close", () => sseClients.delete(res))
+        return
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/projects") {
+        return sendJSON(res, 200, projectDirs().map((dir) => ({ directory: dir, name: projectName(dir) })))
+      }
+
       if (req.method === "GET" && url.pathname === "/api/meta") {
         const [agentsRes, providersRes] = await Promise.all([
-          client.app.agents({ query: { directory } }).catch(() => ({ data: [] })),
-          client.config.providers({ query: { directory } }).catch(() => ({ data: undefined })),
+          client.app.agents({ query: { directory: dir } }).catch(() => ({ data: [] })),
+          client.config.providers({ query: { directory: dir } }).catch(() => ({ data: undefined })),
         ])
         const agents = (agentsRes.data ?? []).map((a) => ({
           name: a.name,
@@ -223,7 +278,8 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
       }
 
       if (req.method === "GET" && url.pathname === "/api/sessions") {
-        const result = await client.session.list({ query: { directory } })
+        const result = await client.session.list({ query: { directory: dir } })
+        for (const s of result.data ?? []) sessionDir.set(s.id, dir)
         const sessions = (result.data ?? [])
           .filter((s) => !s.parentID)
           .sort((a, b) => b.time.updated - a.time.updated)
@@ -235,9 +291,10 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
       if (req.method === "GET" && url.pathname === "/api/state") {
         const sessionID = url.searchParams.get("sessionID")
         if (!sessionID) return sendJSON(res, 400, { error: "sessionID required" })
+        sessionDir.set(sessionID, dir)
         const [messagesRes, statusRes] = await Promise.all([
-          client.session.messages({ path: { id: sessionID }, query: { directory } }),
-          client.session.status({ query: { directory } }).catch(() => ({ data: undefined })),
+          client.session.messages({ path: { id: sessionID }, query: { directory: dir } }),
+          client.session.status({ query: { directory: dir } }).catch(() => ({ data: undefined })),
         ])
         const permissions = [...pendingPermissions.values()]
           .filter((p) => p.sessionID === sessionID)
@@ -254,7 +311,7 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
         const messageID = url.searchParams.get("messageID") ?? ""
         const partID = url.searchParams.get("partID") ?? ""
         if (!sessionID || !messageID || !partID) return sendJSON(res, 400, { error: "missing params" })
-        const result = await client.session.messages({ path: { id: sessionID }, query: { directory } })
+        const result = await client.session.messages({ path: { id: sessionID }, query: { directory: dir } })
         for (const row of result.data ?? []) {
           if (row.info.id !== messageID) continue
           for (const part of row.parts) {
@@ -289,7 +346,7 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
         let sessionID = body.sessionID
         if (sessionID) {
           const status = await client.session
-            .status({ query: { directory } })
+            .status({ query: { directory: dir } })
             .catch(() => ({ data: undefined }))
           if (status.data?.[sessionID]?.type === "busy") {
             return sendJSON(res, 409, { error: "session is busy â€” wait or press Stop" })
@@ -298,11 +355,12 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
         if (!sessionID || sessionID === "null") {
           const created = await client.session.create({
             body: { title: (text || safeName(attachments[0]?.name ?? "session")).slice(0, 80) },
-            query: { directory },
+            query: { directory: dir },
           })
           sessionID = created.data!.id
         }
 
+        sessionDir.set(sessionID, dir)
         // Slash command â†’ run as an opencode command; "!cmd" â†’ run in shell.
         if (text.startsWith("/") && attachments.length === 0) {
           const space = text.indexOf(" ")
@@ -311,7 +369,7 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
           void client.session
             .command({
               path: { id: sessionID },
-              query: { directory },
+              query: { directory: dir },
               body: { command, arguments: args, agent: body.agent || defaultAgent },
             })
             .catch(() => {})
@@ -321,7 +379,7 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
           void client.session
             .shell({
               path: { id: sessionID },
-              query: { directory },
+              query: { directory: dir },
               body: { command: text.slice(1).trim(), agent: body.agent || defaultAgent },
             })
             .catch(() => {})
@@ -352,7 +410,7 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
         void client.session
           .promptAsync({
             path: { id: sessionID },
-            query: { directory },
+            query: { directory: dir },
             body: { parts: parts as any, agent: body.agent || defaultAgent, model },
           })
           .catch(() => {})
@@ -363,7 +421,7 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
         const body = JSON.parse((await readBody(req)) || "{}") as { sessionID?: string }
         if (!body.sessionID) return sendJSON(res, 400, { error: "sessionID required" })
         try {
-          await client.session.abort({ path: { id: body.sessionID }, query: { directory } })
+          await client.session.abort({ path: { id: body.sessionID }, query: { directory: dir } })
         } catch {
           // Session may already be idle â€” nothing to abort.
         }
@@ -383,7 +441,7 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
         try {
           await client.postSessionIdPermissionsPermissionId({
             path: { id: body.sessionID, permissionID: body.permissionID },
-            query: { directory },
+            query: { directory: dir },
             body: { response },
           })
         } catch {
@@ -409,10 +467,28 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
         host = "127.0.0.1"
       }
 
-      server = createServer(handleRequest)
-      await new Promise<void>((resolve) => server!.listen(port, host, resolve))
+      // Try the configured port first, then walk up — so multiple opencode
+      // instances (or a lingering socket) don't leave the tool unstartable.
+      let bound: ReturnType<typeof createServer> | null = null
+      let activePort = port
+      let lastError: unknown
+      for (let attempt = 0; attempt < 12 && !bound; attempt++) {
+        activePort = port + attempt
+        bound = await new Promise((resolve) => {
+          const s = createServer(handleRequest)
+          s.once("error", () => resolve(null))
+          s.listen(activePort, host, () => resolve(s))
+        })
+        if (!bound) lastError = new Error(`port ${activePort} in use`)
+      }
+      if (!bound) {
+        throw lastError ?? new Error(`could not bind any port from ${port}`)
+      }
+      server = bound
 
-      const url = `http://${host}:${port}`
+      heartbeat = setInterval(() => broadcast(": ping"), 25_000)
+
+      const url = `http://${host}:${activePort}`
       try {
         await client.app.log({
           body: { service: "remote-ui", level: "info", message: `remote UI listening on ${url}` },
@@ -456,6 +532,11 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
       }),
     },
     event: async ({ event }) => {
+      if (forwardedEvents.has(event.type)) {
+        const props = event.properties as { sessionID?: string; info?: { id?: string } }
+        const sid = props.sessionID ?? props.info?.id
+        broadcast(JSON.stringify({ type: event.type, sessionID: sid }))
+      }
       switch (event.type) {
         case "permission.updated": {
           const p = event.properties
@@ -473,6 +554,9 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
           break
         }
         case "server.instance.disposed": {
+          if (heartbeat) clearInterval(heartbeat)
+          for (const client of sseClients) client.destroy()
+          sseClients.clear()
           server?.close()
           break
         }

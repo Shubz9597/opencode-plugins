@@ -2,10 +2,14 @@
 
 Custom plugins for [opencode](https://opencode.ai).
 
+> New machine? Follow [`SETUP.md`](./SETUP.md) — it's written so an agent can
+> replicate the whole setup from a single prompt: *"Set up opencode plugins by
+> following SETUP.md in this repo."*
+
 | Plugin                                                     | Description                                                                 |
 | ---------------------------------------------------------- | --------------------------------------------------------------------------- |
 | [`session-cost`](./session-cost)                            | Token in/out + cost tracking per response and per session, toast at end of each chat turn |
-| [`remote-ui`](./remote-ui)                                  | Tailscale-reachable web UI to drive opencode remotely: markdown rendering, file attachments, model/agent pickers, commands, permission approval |
+| [`remote-ui`](./remote-ui)                                  | Tailscale-reachable web UI to drive opencode remotely: multi-project sessions, markdown rendering, file attachments, SSE live updates, permission approval |
 
 ## Usage
 
