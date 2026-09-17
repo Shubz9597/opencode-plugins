@@ -239,18 +239,18 @@
   .dots i:nth-child(3) { animation-delay: .3s; }
   @keyframes bounce { 0%, 60%, 100% { transform: none; opacity: .35; } 30% { transform: translateY(-4px); opacity: 1; } }
   .chip.queued { color: var(--yellow); border-color: rgba(255, 197, 61, 0.34); }
-  .msg.user .bubble { position: relative; }
-  .msg.user .bubble.queued {
-    background: rgba(255, 197, 61, 0.10);
-    border: 1px dashed rgba(255, 197, 61, 0.5);
-    color: var(--yellow);
-    opacity: 1;
-  }
-  .qlabel { font-size: 10.5px; text-transform: uppercase; letter-spacing: .5px;
-            color: var(--yellow); margin-bottom: 5px; }
-  .bubble .qdel { position: absolute; top: 6px; right: 8px; background: none; border: 0;
-                  color: var(--red); font-size: 15px; cursor: pointer; padding: 0;
-                  font-family: var(--sans); }
+  .queuecard { align-self: flex-start; max-width: 94%; border: 1px dashed rgba(255, 197, 61, 0.5);
+               background: rgba(255, 197, 61, 0.06); border-radius: 12px; padding: 10px 14px; }
+  .queuecard .qhead { display: flex; align-items: center; gap: 8px; color: var(--yellow); font-size: 11px;
+                      text-transform: uppercase; letter-spacing: 0.6px; }
+  .qpulse { background: var(--yellow); }
+  .queuecard .qrow { display: flex; align-items: baseline; gap: 9px; padding: 7px 0 2px; margin-top: 7px;
+                     border-top: 1px solid var(--frost-alt); font-size: 13.5px; color: var(--text); }
+  .queuecard .qnum { color: var(--yellow); font-family: var(--mono); font-size: 11px; flex: 0 0 auto; }
+  .queuecard .qtxt { flex: 1; word-break: break-word; white-space: pre-wrap; }
+  .queuecard .qdel { background: none; border: 0; color: var(--red); cursor: pointer; font-size: 14px;
+                     padding: 0 2px; flex: 0 0 auto; font-family: var(--sans); }
+  .queuecard .qdel:hover { color: #ff6b85; }
 
   /* Composer vertical centering + project chips */
   .composer { align-items: center; }
@@ -795,21 +795,35 @@
     if (queueDom) { queueDom.remove(); queueDom = null; }
     if (!queue.length || !current) return;
     queueDom = document.createElement("div");
-    queueDom.className = "msg user";
+    queueDom.className = "queuecard";
+
+    var head = document.createElement("div");
+    head.className = "qhead";
+    var dot = document.createElement("span");
+    dot.className = "pulse qpulse";
+    head.appendChild(dot);
+    var lbl = document.createElement("span");
+    lbl.textContent = "Queued · " + queue.length + " message" + (queue.length > 1 ? "s" : "") +
+      " — sends when the agent finishes";
+    head.appendChild(lbl);
+    queueDom.appendChild(head);
+
     queue.forEach(function (p, i) {
-      var wrap = document.createElement("div");
-      wrap.className = "bubble queued";
-      var label = document.createElement("div");
-      label.className = "qlabel";
-      label.textContent = "⏳ queued — sends when the agent finishes";
+      var row = document.createElement("div");
+      row.className = "qrow";
+      var num = document.createElement("span");
+      num.className = "qnum";
+      num.textContent = (i + 1) + ".";
       var txt = document.createElement("span");
+      txt.className = "qtxt";
       txt.textContent = p.text || "📎 " + ((p.attachments && p.attachments[0] && p.attachments[0].name) || "attachment");
       var x = document.createElement("button");
       x.className = "qdel";
       x.textContent = "×";
+      x.title = "Remove from queue";
       x.addEventListener("click", function () { queue.splice(i, 1); appendQueue(); });
-      wrap.appendChild(label); wrap.appendChild(txt); wrap.appendChild(x);
-      queueDom.appendChild(wrap);
+      row.appendChild(num); row.appendChild(txt); row.appendChild(x);
+      queueDom.appendChild(row);
     });
     msgs.appendChild(queueDom);
     scroll();
