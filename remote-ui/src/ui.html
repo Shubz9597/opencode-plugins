@@ -330,14 +330,21 @@
   var stick = true;
 
   function atBottom() { return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 160; }
-  scroller.addEventListener("scroll", function () { stick = atBottom(); });
+  var lastScroll = 0;
+  scroller.addEventListener("scroll", function () {
+    stick = atBottom();
+    if (!stick) lastScroll = Date.now();
+  });
   function scroll() {
     if (!stick) return;
     // Apply after layout settles — mobile browsers report stale heights mid-render
-    // (fonts/images/keyboard), so pin twice across frames.
+    // (fonts/images/keyboard), so pin across frames plus a late fallback.
     requestAnimationFrame(function () {
+      if (!stick) return;
       scroller.scrollTop = scroller.scrollHeight;
-      requestAnimationFrame(function () { scroller.scrollTop = scroller.scrollHeight; });
+      requestAnimationFrame(function () { if (stick) scroller.scrollTop = scroller.scrollHeight; });
+      setTimeout(function () { if (stick) scroller.scrollTop = scroller.scrollHeight; }, 180);
+      setTimeout(function () { if (stick) scroller.scrollTop = scroller.scrollHeight; }, 450);
     });
   }
 
@@ -575,42 +582,140 @@
     return div;
   }
 
+  var domIds = [];
+  var tailDom = null;
+  var busySeen = false;
+  var stopRequested = 0;
+
+  function buildQueueCard() {
+    var card = document.createElement("div");
+    card.className = "queuecard";
+    var head = document.createElement("div");
+    head.className = "qhead";
+    var dot = document.createElement("span");
+    dot.className = "pulse qpulse";
+    head.appendChild(dot);
+    var lbl = document.createElement("span");
+    lbl.textContent = "Queued · " + queue.length + " message" + (queue.length > 1 ? "s" : "") +
+      " — sends when the agent finishes";
+    head.appendChild(lbl);
+    card.appendChild(head);
+    queue.forEach(function (p, i) {
+      var row = document.createElement("div");
+      row.className = "qrow";
+      var num = document.createElement("span");
+      num.className = "qnum";
+      num.textContent = (i + 1) + ".";
+      var txt = document.createElement("span");
+      txt.className = "qtxt";
+      txt.textContent = p.text || "📎 " + ((p.attachments && p.attachments[0] && p.attachments[0].name) || "attachment");
+      var x = document.createElement("button");
+      x.className = "qdel";
+      x.textContent = "×";
+      x.title = "Remove from queue";
+      x.addEventListener("click", function () { queue.splice(i, 1); refreshQueue(); });
+      row.appendChild(num); row.appendChild(txt); row.appendChild(x);
+      card.appendChild(row);
+    });
+    return card;
+  }
+
+  function refreshQueue() {
+    if (queueDom) { queueDom.remove(); queueDom = null; }
+    if (!queue.length || !current) return;
+    queueDom = buildQueueCard();
+    if (tailDom && tailDom.parentNode === msgs) tailDom.appendChild(queueDom);
+    else {
+      tailDom = document.createElement("div");
+      tailDom.appendChild(queueDom);
+      msgs.appendChild(tailDom);
+    }
+    scroll();
+  }
+
   function renderState(st) {
     var sig = JSON.stringify(st.messages.map(function (m) {
       return [m.id, JSON.stringify(m.segments).length, m.cost, m.attachments.length];
     })) + "|" + st.status + "|" + JSON.stringify(st.permissions.map(function (p) { return p.id; })) + "|" + (st.pendingOther || 0);
     if (lastSig[current] === sig) return;
     lastSig[current] = sig;
-    stick = atBottom();
-    msgs.textContent = "";
-    if (!st.messages.length) { msgs.appendChild(emptyDom()); }
-    // Group messages into turns (user prompt + its assistant/tool messages)
-    // and print a cost/token summary after each completed turn.
+
+    var ids = st.messages.map(function (m) { return m.id; });
+    var structureChanged = ids.length !== domIds.length || ids.some(function (id, i) { return id !== domIds[i]; });
+
+    if (Date.now() - lastScroll > 4000) stick = true;
+    stick = atBottom() || stick;
+
     var turns = [];
     st.messages.forEach(function (m) {
       if (m.role === "user" || !turns.length) turns.push([]);
       turns[turns.length - 1].push(m);
     });
-    turns.forEach(function (group, idx) {
-      group.forEach(function (m) { msgs.appendChild(msgDom(m)); });
-      if (idx === turns.length - 1 && st.status !== "idle") return; // turn still running
-      var sum = turnSumDom(group);
-      if (sum) msgs.appendChild(sum);
-    });
+
+    if (structureChanged) {
+      // Full rebuild only when the message list itself changes.
+      msgs.textContent = "";
+      if (!st.messages.length) { msgs.appendChild(emptyDom()); }
+      turns.forEach(function (group, idx) {
+        group.forEach(function (m) { var el = msgDom(m); el.dataset.mid = m.id; msgs.appendChild(el); });
+        if (idx < turns.length - 1) { var s = turnSumDom(group); if (s) msgs.appendChild(s); }
+      });
+      domIds = ids;
+    } else if (st.messages.length) {
+      // Streaming update: replace only the last bubble in place — no scroll jump.
+      var lastMsg = st.messages[st.messages.length - 1];
+      var existing = null;
+      msgs.querySelectorAll("[data-mid]").forEach(function (el) {
+        if (el.dataset.mid === lastMsg.id) existing = el;
+      });
+      var fresh = msgDom(lastMsg);
+      fresh.dataset.mid = lastMsg.id;
+      if (existing) existing.replaceWith(fresh);
+      else { msgs.appendChild(fresh); domIds.push(lastMsg.id); }
+    }
+
+    // Tail: last turn's summary (when idle) + queued-messages card.
+    if (tailDom) { tailDom.remove(); tailDom = null; }
+    queueDom = null;
+    tailDom = document.createElement("div");
+    var lastTurn = turns.length ? turns[turns.length - 1] : null;
+    if (lastTurn && st.status === "idle") {
+      var s2 = turnSumDom(lastTurn);
+      if (s2) tailDom.appendChild(s2);
+    }
+    if (queue.length && current) { queueDom = buildQueueCard(); tailDom.appendChild(queueDom); }
+    if (tailDom.childNodes.length) msgs.appendChild(tailDom);
+
     for (var i = st.messages.length - 1; i >= 0; i--) {
       if (st.messages[i].role === "assistant" && st.messages[i].model) {
         modelCur.textContent = st.messages[i].model.split("/").slice(1).join("/");
         break;
       }
     }
+
     scroll();
-    appendQueue();
     renderBanner(st.permissions, st.pendingOther || 0);
+
     var lastTool = "";
     for (var i = st.messages.length - 1; i >= 0 && !lastTool; i--) {
       var segs = st.messages[i].segments;
       for (var j = segs.length - 1; j >= 0; j--) {
         if (segs[j].type === "tool") { lastTool = segs[j].name; break; }
+      }
+    }
+
+    if (st.status === "busy") busySeen = true;
+    if (st.status === "idle") {
+      if (stopRequested && Date.now() - stopRequested < 6000) {
+        stopRequested = 0;
+        statusEl.className = "on";
+        statusEl.innerHTML = "Stopped ✓";
+        setTimeout(function () { statusEl.className = ""; statusEl.innerHTML = ""; }, 2500);
+        return;
+      }
+      if (busySeen) {
+        busySeen = false;
+        if (queue.length) { flushQueue(); return; }
       }
     }
     statusEl.className = st.status === "retry" ? "on retry" : st.status === "busy" ? "on" : "";
@@ -619,7 +724,6 @@
       : st.status === "retry"
         ? '<span class="dots"><i></i><i></i><i></i></span> Retrying…'
         : "";
-    appendQueue();
   }
 
   function poll() {
@@ -808,44 +912,6 @@
   var queue = [];
   var queueDom = null;
 
-  function appendQueue() {
-    if (queueDom) { queueDom.remove(); queueDom = null; }
-    if (!queue.length || !current) return;
-    queueDom = document.createElement("div");
-    queueDom.className = "queuecard";
-
-    var head = document.createElement("div");
-    head.className = "qhead";
-    var dot = document.createElement("span");
-    dot.className = "pulse qpulse";
-    head.appendChild(dot);
-    var lbl = document.createElement("span");
-    lbl.textContent = "Queued · " + queue.length + " message" + (queue.length > 1 ? "s" : "") +
-      " — sends when the agent finishes";
-    head.appendChild(lbl);
-    queueDom.appendChild(head);
-
-    queue.forEach(function (p, i) {
-      var row = document.createElement("div");
-      row.className = "qrow";
-      var num = document.createElement("span");
-      num.className = "qnum";
-      num.textContent = (i + 1) + ".";
-      var txt = document.createElement("span");
-      txt.className = "qtxt";
-      txt.textContent = p.text || "📎 " + ((p.attachments && p.attachments[0] && p.attachments[0].name) || "attachment");
-      var x = document.createElement("button");
-      x.className = "qdel";
-      x.textContent = "×";
-      x.title = "Remove from queue";
-      x.addEventListener("click", function () { queue.splice(i, 1); appendQueue(); });
-      row.appendChild(num); row.appendChild(txt); row.appendChild(x);
-      queueDom.appendChild(row);
-    });
-    msgs.appendChild(queueDom);
-    scroll();
-  }
-
   function doSend(payload) {
     sendBtn.disabled = true;
     jsonReq("/api/send?directory=" + encodeURIComponent(activeProject || ""), { method: "POST", body: JSON.stringify(payload) })
@@ -854,7 +920,7 @@
         if (!res.ok) {
           if (res.b && res.b.error && res.b.error.indexOf("busy") >= 0) {
             queue.push(payload);
-            appendQueue();
+            refreshQueue();
           } else {
             alert(res.b.error || "send failed");
           }
@@ -871,7 +937,7 @@
   function flushQueue() {
     if (!queue.length || !current) return;
     var next = queue.shift();
-    appendQueue();
+    refreshQueue();
     doSend(next);
   }
 
@@ -933,7 +999,13 @@
 
   document.getElementById("new").addEventListener("click", function () { setSession(null, null); input.focus(); });
   document.getElementById("stop").addEventListener("click", function () {
-    if (current) jsonReq("/api/abort?directory=" + encodeURIComponent(activeProject || ""), { method: "POST", body: JSON.stringify({ sessionID: current }) });
+    if (!current) return;
+    stopRequested = Date.now();
+    statusEl.className = "on";
+    statusEl.innerHTML = '<span class="dots"><i></i><i></i><i></i></span> Stopping…';
+    jsonReq("/api/abort?directory=" + encodeURIComponent(activeProject || ""), { method: "POST", body: JSON.stringify({ sessionID: current }) });
+    setTimeout(poll, 600);
+    setTimeout(poll, 1500);
   });
   sendBtn.addEventListener("click", send);
   input.addEventListener("keydown", function (e) {
