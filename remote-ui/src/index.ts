@@ -650,28 +650,43 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
       }),
     },
     event: async ({ event }) => {
-      if (forwardedEvents.has(event.type)) {
-        const props = event.properties as { sessionID?: string; info?: { id?: string } }
+      // Runtime event names can differ from the pinned SDK's types (e.g.
+      // permission.asked vs permission.updated) — compare as plain strings.
+      const evtType = (event as { type: string }).type
+      const props = event.properties as {
+        sessionID?: string
+        id?: string
+        type?: string
+        title?: string
+        permissionID?: string
+        info?: { id?: string }
+      }
+
+      if (evtType === "permission.asked" || evtType === "permission.updated") {
+        if (props.id && props.sessionID) {
+          pendingPermissions.set(props.id, {
+            id: props.id,
+            sessionID: props.sessionID,
+            type: props.type ?? "unknown",
+            title: props.title ?? "",
+            time: Date.now(),
+          })
+          notifyTUI(`permission [${props.type}] → ${props.sessionID.slice(-6)}: ${props.title}`)
+          broadcast(JSON.stringify({ type: "permission.updated", sessionID: props.sessionID }))
+        }
+        return
+      }
+      if (evtType === "permission.replied") {
+        if (props.permissionID) pendingPermissions.delete(props.permissionID)
+        broadcast(JSON.stringify({ type: "permission.replied", sessionID: undefined }))
+        return
+      }
+
+      if (forwardedEvents.has(evtType)) {
         const sid = props.sessionID ?? props.info?.id
-        broadcast(JSON.stringify({ type: event.type, sessionID: sid }))
+        broadcast(JSON.stringify({ type: evtType, sessionID: sid }))
       }
       switch (event.type) {
-        case "permission.updated": {
-          const p = event.properties
-          pendingPermissions.set(p.id, {
-            id: p.id,
-            sessionID: p.sessionID,
-            type: p.type,
-            title: p.title,
-            time: p.time?.created ?? Date.now(),
-          })
-          notifyTUI(`permission [${p.type}] → ${p.sessionID.slice(-6)}: ${p.title}`)
-          break
-        }
-        case "permission.replied": {
-          pendingPermissions.delete(event.properties.permissionID)
-          break
-        }
         case "server.instance.disposed": {
           if (heartbeat) clearInterval(heartbeat)
           for (const client of sseClients) client.destroy()
