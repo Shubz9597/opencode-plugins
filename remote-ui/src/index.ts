@@ -555,14 +555,30 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
           return sendJSON(res, 400, { error: "sessionID and permissionID required" })
         }
         const response = body.response === "always" ? "always" : body.response === "reject" ? "reject" : "once"
-        try {
+        const sessionID = body.sessionID
+        const permissionID = body.permissionID
+        // Newer runtimes expose permission.reply({ requestID, reply }); the
+        // generated SDK still routes via /session/{id}/permissions/{permissionID}
+        // where permissionID carries the requestID.
+        const anyClient = client as unknown as {
+          permission?: { reply?: (opts: Record<string, unknown>) => Promise<unknown> }
+        }
+        if (anyClient.permission?.reply) {
+          await anyClient.permission
+            .reply({ requestID: permissionID, reply: response, directory })
+            .catch(() =>
+              client.postSessionIdPermissionsPermissionId({
+                path: { id: sessionID, permissionID: permissionID },
+                query: qDir(dir),
+                body: { response },
+              }),
+            )
+        } else {
           await client.postSessionIdPermissionsPermissionId({
-            path: { id: body.sessionID, permissionID: body.permissionID },
+            path: { id: sessionID, permissionID: permissionID },
             query: qDir(dir),
             body: { response },
           })
-        } catch {
-          // Permission may have been answered from the TUI in the meantime.
         }
         notifyTUI(`permission ${response} → ${body.sessionID.slice(-6)}`)
         return sendJSON(res, 200, { ok: true })
@@ -656,29 +672,36 @@ export const RemoteUIPlugin: Plugin = async ({ client, directory }, options?: Re
       const props = event.properties as {
         sessionID?: string
         id?: string
-        type?: string
-        title?: string
+        permission?: string
+        patterns?: unknown
+        requestID?: string
         permissionID?: string
         info?: { id?: string }
       }
 
       if (evtType === "permission.asked" || evtType === "permission.updated") {
+        // 1.18.31 shape: { id, sessionID, permission, patterns, metadata, always, tool }
         if (props.id && props.sessionID) {
+          const permName = String(props.permission ?? "permission")
+          const patterns = Array.isArray(props.patterns) ? props.patterns.map(String) : []
           pendingPermissions.set(props.id, {
             id: props.id,
             sessionID: props.sessionID,
-            type: props.type ?? "unknown",
-            title: props.title ?? "",
+            type: permName,
+            title: patterns.length ? patterns.join("  ").slice(0, 160) : permName,
             time: Date.now(),
           })
-          notifyTUI(`permission [${props.type}] → ${props.sessionID.slice(-6)}: ${props.title}`)
+          notifyTUI(
+            `permission [${permName}] → ${props.sessionID.slice(-6)}: ${patterns.join(" ").slice(0, 80)}`,
+          )
           broadcast(JSON.stringify({ type: "permission.updated", sessionID: props.sessionID }))
         }
         return
       }
       if (evtType === "permission.replied") {
-        if (props.permissionID) pendingPermissions.delete(props.permissionID)
-        broadcast(JSON.stringify({ type: "permission.replied", sessionID: undefined }))
+        const reqID = props.requestID ?? props.permissionID
+        if (reqID) pendingPermissions.delete(reqID)
+        broadcast(JSON.stringify({ type: "permission.replied" }))
         return
       }
 
