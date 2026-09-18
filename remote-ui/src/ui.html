@@ -331,21 +331,22 @@
 
   function atBottom() { return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 160; }
   var lastScroll = 0;
+  var prevTop = 0;
+  var pinUntil = 0;
   scroller.addEventListener("scroll", function () {
-    stick = atBottom();
-    if (!stick) lastScroll = Date.now();
+    if (Date.now() < pinUntil) return; // ignore our own programmatic pins
+    var top = scroller.scrollTop;
+    if (atBottom()) { stick = true; }
+    else if (top < prevTop - 4) { stick = false; lastScroll = Date.now(); }
+    prevTop = top;
   });
   function scroll() {
     if (!stick) return;
-    // Apply after layout settles — mobile browsers report stale heights mid-render
-    // (fonts/images/keyboard), so pin across frames plus a late fallback.
-    requestAnimationFrame(function () {
-      if (!stick) return;
-      scroller.scrollTop = scroller.scrollHeight;
-      requestAnimationFrame(function () { if (stick) scroller.scrollTop = scroller.scrollHeight; });
-      setTimeout(function () { if (stick) scroller.scrollTop = scroller.scrollHeight; }, 180);
-      setTimeout(function () { if (stick) scroller.scrollTop = scroller.scrollHeight; }, 450);
-    });
+    pinUntil = Date.now() + 600;
+    scroller.scrollTop = scroller.scrollHeight;
+    requestAnimationFrame(function () { if (stick) { pinUntil = Date.now() + 600; scroller.scrollTop = scroller.scrollHeight; } });
+    setTimeout(function () { if (stick) { pinUntil = Date.now() + 500; scroller.scrollTop = scroller.scrollHeight; } }, 180);
+    setTimeout(function () { if (stick) { pinUntil = Date.now() + 500; scroller.scrollTop = scroller.scrollHeight; } }, 450);
   }
 
   function relTime(t) {
@@ -674,6 +675,9 @@
       else { msgs.appendChild(fresh); domIds.push(lastMsg.id); }
     }
 
+    // Pin synchronously BEFORE the browser paints, otherwise the taller content
+    // appears at the old offset for one frame ("jumps to top then comes down").
+    if (stick) { pinUntil = Date.now() + 600; scroller.scrollTop = scroller.scrollHeight; }
     // Tail: last turn's summary (when idle) + queued-messages card.
     if (tailDom) { tailDom.remove(); tailDom = null; }
     queueDom = null;
@@ -954,6 +958,7 @@
     input.value = "";
     input.style.height = "auto";
     attachments = []; addChips();
+    stick = true; lastScroll = 0; // always follow your own message
     doSend(payload);
   }
 
