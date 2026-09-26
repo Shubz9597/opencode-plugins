@@ -22,7 +22,10 @@ public internet.
 - **Permission approval** — when a remote run needs a permission, an
   Allow-once / Always / Deny banner appears so it never gets stuck
 - Busy indicator, Stop button to abort a running turn
-- Per-message cost + model shown under assistant replies
+- Codex-style assistant turns: progress text, reasoning, commands, and tool
+  output are grouped into one elapsed-time accordion; the final response stays
+  visible beneath it
+- Per-turn cost and token usage shown under assistant replies
 - Optional shared-token auth
 
 ## Install

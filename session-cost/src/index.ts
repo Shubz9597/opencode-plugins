@@ -1,84 +1,18 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
-
-/** Rates per 1M tokens, as published by providers / models.dev. */
-type Rates = {
-  input: number
-  output: number
-  cache_read: number
-  cache_write: number
-}
-
-type Usage = {
-  input: number
-  output: number
-  reasoning: number
-  cacheRead: number
-  cacheWrite: number
-  cost: number
-  reportedCost: number
-  messages: number
-  durationMs: number
-}
-
-const emptyUsage = (): Usage => ({
-  input: 0,
-  output: 0,
-  reasoning: 0,
-  cacheRead: 0,
-  cacheWrite: 0,
-  cost: 0,
-  reportedCost: 0,
-  messages: 0,
-  durationMs: 0,
-})
-
-function addUsage(target: Usage, delta: Usage): void {
-  target.input += delta.input
-  target.output += delta.output
-  target.reasoning += delta.reasoning
-  target.cacheRead += delta.cacheRead
-  target.cacheWrite += delta.cacheWrite
-  target.cost += delta.cost
-  target.reportedCost += delta.reportedCost
-  target.messages += delta.messages
-  target.durationMs += delta.durationMs
-}
-
-function fmtInt(n: number): string {
-  return Math.round(n).toLocaleString("en-US")
-}
-
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
-  return fmtInt(n)
-}
-
-function fmtCost(cost: number): string {
-  if (cost >= 1) return `$${cost.toFixed(2)}`
-  if (cost >= 0.01) return `$${cost.toFixed(3)}`
-  return `$${cost.toFixed(4)}`
-}
-
-function fmtMs(ms: number): string {
-  if (ms >= 60_000) {
-    const minutes = Math.floor(ms / 60_000)
-    const seconds = Math.round((ms % 60_000) / 1000)
-    return `${minutes}m${seconds > 0 ? ` ${seconds}s` : ""}`
-  }
-  return `${(ms / 1000).toFixed(1)}s`
-}
-
-/**
- * Corrected rates for models where models.dev is known to be stale or wrong.
- * Keyed by "providerID/modelID", values are USD per 1M tokens.
- * Sources: official provider pricing pages.
- */
-const KNOWN_RATES: Record<string, Rates> = {
-  // Z.AI official pricing (https://docs.z.ai/guides/overview/pricing, verified 2026-09-17).
-  // models.dev currently lists these at half price.
-  "zai/glm-5.3-flash": { input: 0.15, output: 0.5, cache_read: 0.03, cache_write: 0 },
-}
+import {
+  addUsage,
+  computeCost,
+  emptyUsage,
+  fmtCost,
+  fmtMs,
+  fmtTokens,
+  KNOWN_RATES,
+  parsePriceTable,
+  usageFromMessage,
+  type PriceTable,
+  type Rates,
+  type Usage,
+} from "./accounting"
 
 export type SessionCostOptions = {
   /** Toast duration in ms (default 8000) */
@@ -101,31 +35,6 @@ export type SessionCostOptions = {
   rates?: Record<string, Rates>
   /** Prefer opencode's own reported cost over recomputed cost (default false) */
   useReportedCost?: boolean
-}
-
-type PriceTable = Map<string, Rates>
-
-function parsePriceTable(json: unknown): PriceTable {
-  const table: PriceTable = new Map()
-  const providers = (json as Record<string, any>) ?? {}
-  for (const [providerID, provider] of Object.entries(providers)) {
-    const models = (provider as any)?.models as Record<string, any> | undefined
-    if (!models) continue
-    for (const [modelID, model] of Object.entries(models)) {
-      const cost = model?.cost
-      if (typeof cost?.input !== "number" || typeof cost?.output !== "number") continue
-      const rates: Rates = {
-        input: cost.input,
-        output: cost.output,
-        cache_read: typeof cost.cache_read === "number" ? cost.cache_read : 0,
-        cache_write: typeof cost.cache_write === "number" ? cost.cache_write : 0,
-      }
-      table.set(`${providerID}/${modelID}`, rates)
-      // Also index by modelID alone as a fallback for providers that rename models.
-      if (!table.has(modelID)) table.set(modelID, rates)
-    }
-  }
-  return table
 }
 
 export const SessionCostPlugin: Plugin = async ({ client, directory }, options?: SessionCostOptions) => {
@@ -171,26 +80,19 @@ export const SessionCostPlugin: Plugin = async ({ client, directory }, options?:
     return priceTable.get(`${providerID}/${modelID}`) ?? priceTable.get(modelID)
   }
 
-  function computeCost(
-    tokens: { input: number; output: number; cacheRead: number; cacheWrite: number },
-    rates: Rates,
-  ): number {
-    return (
-      (tokens.input * rates.input +
-        tokens.output * rates.output +
-        tokens.cacheRead * rates.cache_read +
-        tokens.cacheWrite * rates.cache_write) /
-      1_000_000
-    )
-  }
-
   // Per-turn and per-session cumulative usage, keyed by sessionID.
   const turn = new Map<string, Usage>()
   const session = new Map<string, Usage>()
   // When the current turn started (first user message of the turn).
   const turnStart = new Map<string, number>()
-  // Assistant messages already counted, so repeated `message.updated` events don't double-count.
+  // Assistant messages already counted, so repeated `message.updated` events
+  // don't double-count. This set is intentionally never cleared: clearing it
+  // and recounting history would inflate session totals. IDs are small;
+  // tens of thousands cost only a few MB.
   const counted = new Set<string>()
+  // Latest usage per message ID, so a late/corrected `message.updated` can
+  // replace the old record and apply its difference instead of double-counting.
+  const perMessage = new Map<string, { sessionID: string; usage: Usage }>()
   // Child (subagent/task) sessions — we don't toast for those to avoid noise.
   const childSessions = new Set<string>()
 
@@ -225,15 +127,13 @@ export const SessionCostPlugin: Plugin = async ({ client, directory }, options?:
 
         case "message.updated": {
           const msg = event.properties.info
+          if (!msg?.id) break
           if (msg.role === "user") {
             if (!turnStart.has(msg.sessionID)) turnStart.set(msg.sessionID, msg.time.created)
             break
           }
           if (msg.role !== "assistant") break
           if (!msg.time?.completed) break
-          if (counted.has(msg.id)) break
-          counted.add(msg.id)
-          if (counted.size > 5000) counted.clear()
 
           const input = msg.tokens?.input ?? 0
           const output = msg.tokens?.output ?? 0
@@ -249,16 +149,29 @@ export const SessionCostPlugin: Plugin = async ({ client, directory }, options?:
               ? computeCost({ input, output, cacheRead, cacheWrite }, rates)
               : reported
 
-          const usage: Usage = {
-            input,
-            output: output + reasoning,
-            reasoning,
-            cacheRead,
-            cacheWrite,
-            cost,
-            reportedCost: reported,
-            messages: 1,
-            durationMs: Math.max(0, (msg.time.completed ?? 0) - (msg.time.created ?? 0)),
+          const usage = usageFromMessage(msg, cost)
+
+          if (counted.has(msg.id)) {
+            // Reconciliation: replace the old record and apply its difference.
+            const prev = perMessage.get(msg.id)
+            if (prev) {
+              const inverse = emptyUsage()
+              addUsage(inverse, prev.usage)
+              for (const key of Object.keys(inverse) as Array<keyof Usage>) {
+                inverse[key] = -inverse[key]
+              }
+              bump(turn, prev.sessionID, inverse)
+              bump(session, prev.sessionID, inverse)
+            }
+          } else {
+            counted.add(msg.id)
+          }
+          perMessage.set(msg.id, { sessionID: msg.sessionID, usage })
+          if (perMessage.size > 10_000) {
+            // Memory bound only — drop the oldest per-message records; session
+            // totals already include them and `counted` still guards replays.
+            const oldest = perMessage.keys().next().value
+            if (oldest !== undefined) perMessage.delete(oldest)
           }
           bump(turn, msg.sessionID, usage)
           bump(session, msg.sessionID, usage)
@@ -308,6 +221,9 @@ export const SessionCostPlugin: Plugin = async ({ client, directory }, options?:
           session.delete(sessionID)
           turnStart.delete(sessionID)
           childSessions.delete(sessionID)
+          for (const [msgID, rec] of perMessage) {
+            if (rec.sessionID === sessionID) perMessage.delete(msgID)
+          }
           break
         }
       }
@@ -342,14 +258,32 @@ export const SessionCostPlugin: Plugin = async ({ client, directory }, options?:
             let input = 0
             let output = 0
             let cacheRead = 0
+            let cacheWrite = 0
             let cost = 0
             let count = 0
             for (const { info } of msgs.data ?? []) {
               if (info.role !== "assistant") continue
-              input += info.tokens?.input ?? 0
-              output += (info.tokens?.output ?? 0) + (info.tokens?.reasoning ?? 0)
-              cacheRead += info.tokens?.cache?.read ?? 0
-              cost += info.cost ?? 0
+              const tIn = info.tokens?.input ?? 0
+              const tOut = info.tokens?.output ?? 0
+              const tCacheRead = info.tokens?.cache?.read ?? 0
+              const tCacheWrite = info.tokens?.cache?.write ?? 0
+              const reported = info.cost ?? 0
+              // Same policy as the toast: recompute from tokens when we have
+              // rates, so this surface cannot disagree with the sidebar/toast.
+              const c =
+                useReportedCost || !info.providerID
+                  ? reported
+                  : (() => {
+                      const rates = lookupRates(info.providerID, info.modelID)
+                      return rates
+                        ? computeCost({ input: tIn, output: tOut, cacheRead: tCacheRead, cacheWrite: tCacheWrite }, rates)
+                        : reported
+                    })()
+              input += tIn
+              output += tOut
+              cacheRead += tCacheRead
+              cacheWrite += tCacheWrite
+              cost += c
               count++
             }
             if (count === 0) continue
@@ -426,8 +360,8 @@ export const SessionCostPlugin: Plugin = async ({ client, directory }, options?:
           )
           lines.push("")
           lines.push(
-            "Cost = tokens x provider rates (z.ai: $0.15 in / $0.50 out / $0.03 cached per 1M), " +
-              "so it should match what z.ai deducts (minus non-token charges like web search).",
+            "Cost = tokens x provider rates (overrides + models.dev; corrected rates take priority), " +
+              "an estimate that should track provider invoices (minus non-token charges).",
           )
           return lines.join("\n")
         },

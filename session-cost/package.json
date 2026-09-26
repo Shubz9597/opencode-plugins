@@ -4,6 +4,15 @@
   "description": "opencode plugin that tracks token usage and cost per response and per session, with a toast summary at the end of every chat turn",
   "type": "module",
   "main": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.mjs"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./server": "./src/index.ts",
+    "./tui": "./src/tui.tsx"
+  },
   "files": [
     "src"
   ],
@@ -15,8 +24,12 @@
   ],
   "license": "MIT",
   "devDependencies": {
-    "@opencode-ai/plugin": "latest",
-    "@opencode-ai/sdk": "latest",
+    "@opencode-ai/plugin": "^1.18.31",
+    "@opencode-ai/sdk": "^1.18.31",
+    "@opentui/core": "0.4.5",
+    "@opentui/keymap": "0.4.5",
+    "@opentui/solid": "0.4.5",
+    "solid-js": "1.9.12",
     "typescript": "^5.6.0"
   }
 }

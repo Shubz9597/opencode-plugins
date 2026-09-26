@@ -4,6 +4,10 @@
   "description": "opencode plugin that serves a mobile-friendly web UI on your Tailscale network (or localhost) so you can send messages to opencode sessions remotely",
   "type": "module",
   "main": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.mjs"
+  },
   "files": [
     "src"
   ],

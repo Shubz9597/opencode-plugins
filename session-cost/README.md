@@ -10,15 +10,37 @@ Numbers come straight from opencode's own per-message accounting (`message.updat
 
 ## Install
 
+### TUI sidebar
+
+OpenCode 1.18.31 supports a separate TUI plugin. Add this entry to the existing
+`plugin` array in your global or project `tui.json`, then restart the TUI:
+
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": ["Z:/Projects/opencode-plugins/session-cost/src/tui.tsx"]
+}
+```
+
+The sidebar shows full-session input, output, reasoning, cache read/write and
+cost totals. Estimates are labelled. The same `rates`, `pricingUrl` and
+`useReportedCost` options can be passed in the plugin tuple. This entry is
+separate from the server plugin below. See [shared-session setup](../REMOTE_TUI_SETUP.md).
+
 ### Option A — project-local copy
 
-Copy `src/index.ts` into your project:
+Keep `src/index.ts` and its imported `src/accounting.ts` together, or use the
+config reference below. Copying only `index.ts` no longer works because the
+accounting helpers are shared with the TUI and remote interface.
+
+For a local copy, preserve both files under:
 
 ```
-.opencode/plugin/session-cost.ts
+.opencode/plugins/session-cost/index.ts
+.opencode/plugins/session-cost/accounting.ts
 ```
 
-It is auto-loaded at startup, no config needed.
+Reference the copied `index.ts` explicitly in `opencode.json`.
 
 ### Option B — config reference
 
